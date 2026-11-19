@@ -3,17 +3,18 @@
  * SPDX-License-Identifier: Apache-2.0.
  */
 
-#include <aws/checksums/crc.h>
-#include <aws/checksums/private/crc64_priv.h>
-#include <aws/checksums/private/crc_util.h>
-#include <aws/common/cpuid.h>
+#include "crc64_priv.h"
 
-large_buffer_apply_impl(crc64, uint64_t)
+#ifdef _WIN32
+#    include <windows.h>
+#else
+#    include <pthread.h>
+#endif
 
-    AWS_ALIGNED_TYPEDEF(uint8_t, checksums_masks_shifts_type[6][16], 16);
+AWS_CRC64_ALIGNED_TYPEDEF(uint8_t, checksums_maxks_shifts_type[6][16], 16);
 
 // Intel PSHUFB / ARM VTBL patterns for left/right shifts and masks
-checksums_masks_shifts_type aws_checksums_masks_shifts = {
+checksums_maxks_shifts_type aws_checksums_masks_shifts = {
     {0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80}, //
     {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f}, // left/right
                                                                                                       // shifts
@@ -23,7 +24,7 @@ checksums_masks_shifts_type aws_checksums_masks_shifts = {
     {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, //
 };
 
-AWS_ALIGNED_TYPEDEF(aws_checksums_crc64_constants_t, checksums_constants, 16);
+AWS_CRC64_ALIGNED_TYPEDEF(aws_checksums_crc64_constants_t, checksums_constants, 16);
 
 /* clang-format off */
 
@@ -382,69 +383,122 @@ checksums_constants aws_checksums_crc64nvme_constants = {
 };
 /* clang-format on */
 
-static uint64_t (*s_crc64nvme_fn_ptr)(const uint8_t *input, int length, uint64_t prev_crc64) = NULL;
-static uint64_t (*s_crc64nvme_combine_fn_ptr)(uint64_t crc1, uint64_t crc2, uint64_t len2) = NULL;
+typedef uint64_t (*crc64_update_fn)(const uint8_t *, int, uint64_t);
+typedef uint64_t (*crc64_combine_fn)(uint64_t, uint64_t, uint64_t);
 
-void aws_checksums_crc64_init(void) {
-    if (s_crc64nvme_fn_ptr == NULL) {
-#if defined(AWS_USE_CPU_EXTENSIONS) && defined(AWS_ARCH_INTEL_X64) && !(defined(_MSC_VER) && _MSC_VER < 1920)
-#    if defined(AWS_HAVE_AVX512_INTRINSICS)
-        if (aws_cpu_has_feature(AWS_CPU_FEATURE_AVX512) && aws_cpu_has_feature(AWS_CPU_FEATURE_VPCLMULQDQ)) {
-            s_crc64nvme_fn_ptr = aws_checksums_crc64nvme_intel_avx512;
-        } else
-#    endif
-#    if defined(AWS_HAVE_CLMUL) && defined(AWS_HAVE_AVX2_INTRINSICS)
-            if (aws_cpu_has_feature(AWS_CPU_FEATURE_CLMUL) && aws_cpu_has_feature(AWS_CPU_FEATURE_AVX2)) {
-            s_crc64nvme_fn_ptr = aws_checksums_crc64nvme_intel_clmul;
-        } else {
-            s_crc64nvme_fn_ptr = aws_checksums_crc64nvme_sw;
-        }
-#    endif
-#    if !(defined(AWS_HAVE_AVX512_INTRINSICS) || (defined(AWS_HAVE_CLMUL) && defined(AWS_HAVE_AVX2_INTRINSICS)))
-        s_crc64nvme_fn_ptr = aws_checksums_crc64nvme_sw;
-#    endif
+static crc64_update_fn s_crc64nvme_fn_ptr;
+static crc64_combine_fn s_crc64nvme_combine_fn_ptr;
 
-#elif defined(AWS_USE_CPU_EXTENSIONS) && defined(AWS_ARCH_ARM64) && defined(AWS_HAVE_ARMv8_1)
-        if (aws_cpu_has_feature(AWS_CPU_FEATURE_ARM_CRYPTO) && aws_cpu_has_feature(AWS_CPU_FEATURE_ARM_PMULL)) {
-            s_crc64nvme_fn_ptr = aws_checksums_crc64nvme_arm_pmull;
-        } else {
-            s_crc64nvme_fn_ptr = aws_checksums_crc64nvme_sw;
-        }
-#else // this branch being taken means it's not arm64 and not intel with avx extensions
-        s_crc64nvme_fn_ptr = aws_checksums_crc64nvme_sw;
+// Publish the selected entry points once. The steady-state GNU/Clang path
+// only acquires a function pointer; other compilers use the once primitive.
+#if defined(__GNUC__) || defined(__clang__)
+#    define AWS_CRC64_STORE_DISPATCH(pointer, value) __atomic_store_n(&(pointer), (value), __ATOMIC_RELEASE)
+#    define AWS_CRC64_LOAD_DISPATCH(pointer) __atomic_load_n(&(pointer), __ATOMIC_ACQUIRE)
+#else
+#    define AWS_CRC64_STORE_DISPATCH(pointer, value) ((pointer) = (value))
 #endif
-    }
 
-    if (s_crc64nvme_combine_fn_ptr == NULL) {
-        // arm only fancy version for now. still need to implement x64
-#if defined(AWS_USE_CPU_EXTENSIONS) && defined(AWS_ARCH_ARM64) && defined(AWS_HAVE_ARMv8_1)
-        if (aws_cpu_has_feature(AWS_CPU_FEATURE_ARM_PMULL)) {
-            s_crc64nvme_combine_fn_ptr = aws_checksums_crc64nvme_combine_arm_pmull;
-        } else {
-            s_crc64nvme_combine_fn_ptr = aws_checksums_crc64nvme_combine_sw;
-        }
-#else // this branch being taken means it's not arm64 and not intel with avx extensions
-        s_crc64nvme_combine_fn_ptr = aws_checksums_crc64nvme_combine_sw;
-#endif
+static void s_resolve_dispatch(void) {
+    crc64_update_fn update = aws_checksums_crc64nvme_sw;
+    crc64_combine_fn combine = aws_checksums_crc64nvme_combine_sw;
+#if defined(AWS_CRC64_HAVE_AVX512_INTRINSICS) && defined(AWS_CRC64_ARCH_INTEL_X64)
+    if (aws_crc64_cpu_has_feature(AWS_CRC64_CPU_FEATURE_AVX512) &&
+        aws_crc64_cpu_has_feature(AWS_CRC64_CPU_FEATURE_VPCLMULQDQ)) {
+        update = aws_checksums_crc64nvme_intel_avx512;
     }
+#endif
+#if defined(AWS_CRC64_HAVE_CLMUL_INTRINSICS) && defined(AWS_CRC64_ARCH_INTEL_X64)
+    if (update == aws_checksums_crc64nvme_sw &&
+        aws_crc64_cpu_has_feature(AWS_CRC64_CPU_FEATURE_CLMUL) &&
+        aws_crc64_cpu_has_feature(AWS_CRC64_CPU_FEATURE_AVX2) &&
+        aws_crc64_cpu_has_feature(AWS_CRC64_CPU_FEATURE_SSE_4_2)) {
+        update = aws_checksums_crc64nvme_intel_clmul;
+    }
+#elif defined(AWS_CRC64_HAVE_ARM_PMULL) && defined(AWS_CRC64_ARCH_ARM64)
+    if (aws_crc64_cpu_has_feature(AWS_CRC64_CPU_FEATURE_ARM_PMULL)) {
+        combine = aws_checksums_crc64nvme_combine_arm_pmull;
+        if (aws_crc64_cpu_has_feature(AWS_CRC64_CPU_FEATURE_ARM_CRYPTO)) {
+            update = aws_checksums_crc64nvme_arm_pmull;
+        }
+    }
+#endif
+    AWS_CRC64_STORE_DISPATCH(s_crc64nvme_combine_fn_ptr, combine);
+    AWS_CRC64_STORE_DISPATCH(s_crc64nvme_fn_ptr, update);
 }
 
-uint64_t aws_checksums_crc64nvme(const uint8_t *input, int length, uint64_t prev_crc64) {
-    if (AWS_UNLIKELY(s_crc64nvme_fn_ptr == NULL || s_crc64nvme_combine_fn_ptr == NULL)) {
-        aws_checksums_crc64_init();
-    }
+#ifdef _WIN32
+static BOOL CALLBACK s_resolve_dispatch_once(PINIT_ONCE once, PVOID parameter, PVOID *context) {
+    (void)once;
+    (void)parameter;
+    (void)context;
+    s_resolve_dispatch();
+    return TRUE;
+}
+#endif
 
-    return s_crc64nvme_fn_ptr(input, length, prev_crc64);
+void aws_checksums_crc64_init(void) {
+#ifdef _WIN32
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, s_resolve_dispatch_once, NULL, NULL);
+#else
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, s_resolve_dispatch);
+#endif
+}
+
+#if defined(AWS_CRC64_HAVE_ARM_PMULL) && defined(AWS_CRC64_ARCH_ARM64) && \
+    (defined(__ARM_FEATURE_CRYPTO) || defined(__ARM_FEATURE_AES))
+// PMULL is guaranteed by the configured instruction set for this slice.
+#    define AWS_CRC64_DIRECT_PMULL 1
+#endif
+
+#if defined(AWS_CRC64_LOAD_DISPATCH) && !defined(AWS_CRC64_DIRECT_PMULL)
+static __attribute__((cold, noinline)) uint64_t
+s_initialize_and_update(const uint8_t *input, int length, uint64_t previous) {
+    aws_checksums_crc64_init();
+    return AWS_CRC64_LOAD_DISPATCH(s_crc64nvme_fn_ptr)(input, length, previous);
+}
+
+static __attribute__((cold, noinline)) uint64_t s_initialize_and_combine(uint64_t crc1, uint64_t crc2, uint64_t len2) {
+    aws_checksums_crc64_init();
+    return AWS_CRC64_LOAD_DISPATCH(s_crc64nvme_combine_fn_ptr)(crc1, crc2, len2);
+}
+#endif
+
+uint64_t aws_checksums_crc64nvme(const uint8_t *input, int length, uint64_t prev_crc64) {
+#if defined(AWS_CRC64_DIRECT_PMULL)
+    return aws_checksums_crc64nvme_arm_pmull(input, length, prev_crc64);
+#else
+#    if defined(AWS_CRC64_LOAD_DISPATCH)
+    crc64_update_fn update = AWS_CRC64_LOAD_DISPATCH(s_crc64nvme_fn_ptr);
+    if (AWS_CRC64_UNLIKELY(!update)) {
+        return s_initialize_and_update(input, length, prev_crc64);
+    }
+#    else
+    aws_checksums_crc64_init();
+    crc64_update_fn update = s_crc64nvme_fn_ptr;
+#    endif
+    return update(input, length, prev_crc64);
+#endif
 }
 
 uint64_t aws_checksums_crc64nvme_ex(const uint8_t *input, size_t length, uint64_t previous_crc64) {
-    return aws_large_buffer_apply_crc64(aws_checksums_crc64nvme, input, length, previous_crc64);
+    return aws_crc64_large_buffer_apply(aws_checksums_crc64nvme, input, length, previous_crc64);
 }
 
 uint64_t aws_checksums_crc64nvme_combine(uint64_t crc1, uint64_t crc2, uint64_t len2) {
-    if (AWS_UNLIKELY(s_crc64nvme_fn_ptr == NULL || s_crc64nvme_combine_fn_ptr == NULL)) {
-        aws_checksums_crc64_init();
+#if defined(AWS_CRC64_DIRECT_PMULL)
+    return aws_checksums_crc64nvme_combine_arm_pmull(crc1, crc2, len2);
+#else
+#    if defined(AWS_CRC64_LOAD_DISPATCH)
+    crc64_combine_fn combine = AWS_CRC64_LOAD_DISPATCH(s_crc64nvme_combine_fn_ptr);
+    if (AWS_CRC64_UNLIKELY(!combine)) {
+        return s_initialize_and_combine(crc1, crc2, len2);
     }
-
-    return s_crc64nvme_combine_fn_ptr(crc1, crc2, len2);
+#    else
+    aws_checksums_crc64_init();
+    crc64_combine_fn combine = s_crc64nvme_combine_fn_ptr;
+#    endif
+    return combine(crc1, crc2, len2);
+#endif
 }

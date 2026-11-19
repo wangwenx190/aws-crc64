@@ -3,10 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0.
  */
 
-#include <aws/checksums/private/crc64_priv.h>
-#include <aws/common/config.h>
+#include "../crc64_priv.h"
 
-#if INTPTR_MAX == INT64_MAX && defined(AWS_HAVE_ARMv8_1)
+#if defined(AWS_CRC64_HAVE_ARM_PMULL) && defined(AWS_CRC64_ARCH_ARM64)
 
 #    include <arm_neon.h>
 
@@ -49,6 +48,10 @@
 #    endif // defined(__ARM_FEATURE_SHA3)
 
 /** Compute CRC64NVME using ARMv8 NEON +crypto/pmull64 instructions. */
+#    if defined(__APPLE__) && defined(__clang__)
+// Keep the short-message path aligned as in the upstream macOS build.
+__attribute__((aligned(128)))
+#    endif
 uint64_t aws_checksums_crc64nvme_arm_pmull(const uint8_t *input, int length, const uint64_t previous_crc64) {
     if (!input || length <= 0) {
         return previous_crc64;
@@ -246,7 +249,7 @@ static inline poly64x2_t shift_crc_pmull(poly64x2_t shifted_crc, int64_t length)
 }
 
 uint64_t aws_checksums_crc64nvme_combine_arm_pmull(uint64_t crc1, uint64_t crc2, uint64_t len2) {
-    if (AWS_UNLIKELY(len2 == 0)) {
+    if (AWS_CRC64_UNLIKELY(len2 == 0)) {
         return crc1;
     }
 
@@ -262,4 +265,4 @@ uint64_t aws_checksums_crc64nvme_combine_arm_pmull(uint64_t crc1, uint64_t crc2,
     return crc1 ^ crc2;
 }
 
-#endif // INTPTR_MAX == INT64_MAX && defined(AWS_HAVE_ARMv8_1)
+#endif // defined(AWS_CRC64_HAVE_ARM_PMULL) && defined(AWS_CRC64_ARCH_ARM64)

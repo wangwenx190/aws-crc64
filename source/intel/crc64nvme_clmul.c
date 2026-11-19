@@ -3,11 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0.
  */
 
-#include <aws/checksums/private/crc64_priv.h>
-#include <aws/common/assert.h>
+#include "../crc64_priv.h"
 
-// msvc compilers older than 2019 are missing some intrinsics. Gate those off.
-#if defined(AWS_ARCH_INTEL_X64) && defined(AWS_HAVE_CLMUL) && !(defined(_MSC_VER) && _MSC_VER < 1920)
+#if defined(AWS_CRC64_HAVE_CLMUL_INTRINSICS) && defined(AWS_CRC64_ARCH_INTEL_X64)
 
 #    include <emmintrin.h>
 #    include <immintrin.h>
@@ -144,4 +142,4 @@ uint64_t aws_checksums_crc64nvme_intel_clmul(const uint8_t *input, int length, u
     return ~(uint64_t)_mm_extract_epi64(reduced, 1);
 }
 
-#endif /* defined(AWS_ARCH_INTEL_X64) && defined(AWS_HAVE_CLMUL) && !(defined(_MSC_VER) && _MSC_VER < 1920) */
+#endif /* defined(AWS_CRC64_HAVE_CLMUL_INTRINSICS) && defined(AWS_CRC64_ARCH_INTEL_X64) */

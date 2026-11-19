@@ -1,175 +1,192 @@
-cmake_minimum_required(VERSION 3.9...3.31)
+cmake_minimum_required(VERSION 4.0)
 
-option(STATIC_CRT "Windows specific option that to specify static/dynamic run-time library" OFF)
+project(aws-crc64
+    VERSION 1.0.0
+    DESCRIPTION "Self-contained CRC64-NVME (CRC64-Rocksoft) C library"
+    LANGUAGES C
+)
 
-# In-source builds inherit aws-c-common's module path from the parent. Standalone
-# builds must locate the installed modules here: find_package needs an enabled
-# language, so it cannot run until after project().
-if (NOT IN_SOURCE_BUILD)
-    find_file(AWS_GET_VERSION_MODULE AwsGetVersion.cmake
-            PATH_SUFFIXES lib/cmake/aws-c-common/modules lib64/cmake/aws-c-common/modules)
-    if (NOT AWS_GET_VERSION_MODULE)
-        message(FATAL_ERROR "Could not find AwsGetVersion.cmake from an installed aws-c-common. Set CMAKE_PREFIX_PATH to the aws-c-common install prefix.")
+if(WIN32)
+    enable_language(RC)
+endif()
+if(NOT DEFINED CMAKE_BUILD_TYPE AND NOT DEFINED CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE "Release")
+endif()
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_C_VISIBILITY_PRESET "hidden")
+if(NOT "x${CMAKE_C_FLAGS}" STREQUAL "x")
+    if(MSVC)
+        string(REGEX REPLACE " [/-]W[01234] " " " CMAKE_C_FLAGS ${CMAKE_C_FLAGS})
+    else()
+        string(REGEX REPLACE " -W(all)?(extra)? " " " CMAKE_C_FLAGS ${CMAKE_C_FLAGS})
+        string(REGEX REPLACE " -[W]?pedantic " " " CMAKE_C_FLAGS ${CMAKE_C_FLAGS})
     endif()
-    get_filename_component(AWS_COMMON_MODULE_DIR "${AWS_GET_VERSION_MODULE}" DIRECTORY)
-    list(APPEND CMAKE_MODULE_PATH "${AWS_COMMON_MODULE_DIR}")
+endif()
+string(APPEND CMAKE_C_FLAGS " -w ")
+
+set(__top_level ON)
+if("x${CMAKE_SOURCE_DIR}" STREQUAL "x${PROJECT_SOURCE_DIR}")
+    message("AWS-CRC64: Building as a top-level project.")
+else()
+    set(__top_level OFF)
+    message("AWS-CRC64: Building as a subproject.")
 endif()
 
-include(AwsGetVersion)
-aws_get_version(AWS_CHECKSUMS_VERSION AWS_CHECKSUMS_SOVERSION)
-
-project(aws-checksums LANGUAGES C VERSION ${AWS_CHECKSUMS_VERSION})
-if (NOT IN_SOURCE_BUILD)
-    # this is required so we can use aws-c-common's CMake modules
-    find_package(aws-c-common REQUIRED)
+option(AWS_CRC64_BUILD_SHARED "Build shared library edition of aws-crc64." ON)
+option(AWS_CRC64_BUILD_STATIC "Build static library edition of aws-crc64." ON)
+option(AWS_CRC64_INSTALL "Enable installation for aws-crc64." OFF)
+if(NOT AWS_CRC64_BUILD_SHARED AND NOT AWS_CRC64_BUILD_STATIC)
+    message(SEND_ERROR "You MUST build either the shared library or the static library or both of them!")
 endif()
 
-include(AwsSIMD)
-include(AwsCFlags)
-include(AwsCheckHeaders)
-include(AwsSharedLibSetup)
-include(AwsSanitizers)
-include(CheckCCompilerFlag)
-include(AwsFindPackage)
-include(AwsFeatureTests)
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+    string(TOLOWER "${CMAKE_OSX_ARCHITECTURES}" __architecture)
+elseif(CMAKE_C_COMPILER_ARCHITECTURE_ID)
+    string(TOLOWER "${CMAKE_C_COMPILER_ARCHITECTURE_ID}" __architecture)
+else()
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" __architecture)
+endif()
+set(__x64 OFF)
+set(__arm64 OFF)
+foreach(__arch IN LISTS __architecture)
+    if(__arch MATCHES "^(amd64|x86_64|x64)$")
+        set(__x64 ON)
+    elseif(__arch MATCHES "^(aarch64|arm64|arm64e)$")
+        set(__arm64 ON)
+    endif()
+endforeach()
+
+function(add_kernel_flags source architecture)
+    if(APPLE AND __architecture MATCHES ";")
+        foreach(flag IN LISTS ARGN)
+            set_property(SOURCE "${source}" APPEND PROPERTY COMPILE_OPTIONS
+                "-Xarch_${architecture}" "${flag}")
+        endforeach()
+    else()
+        set_property(SOURCE "${source}" APPEND PROPERTY COMPILE_OPTIONS ${ARGN})
+    endif()
+endfunction()
+
+# We assume a recent toolchain, so the intrinsics used by the SIMD kernels are always
+# available at build time and there is no compile-time feature detection. Whether a
+# kernel may actually *run* is still decided at runtime (see source/crc64_cpuid.c).
+# The special instruction set flags are scoped to the kernel translation units only.
+# Note for MSVC: intrinsics compile fine without any /arch switch, but passing it makes
+# the compiler use consistent VEX/EVEX encoding for the whole translation unit instead
+# of mixing legacy SSE encodings with VEX/EVEX ones in the hot path.
+if(__x64)
+    if(MSVC)
+        add_kernel_flags(source/intel/crc64nvme_clmul.c x86_64 /arch:AVX2)
+        add_kernel_flags(source/intel/crc64nvme_avx512.c x86_64 /arch:AVX512)
+    else()
+        add_kernel_flags(source/intel/crc64nvme_clmul.c x86_64 -msse4.2 -mpclmul -mavx2)
+        add_kernel_flags(source/intel/crc64nvme_avx512.c x86_64
+            -msse4.2 -mpclmul -mavx2 -mavx512f -mavx512vl -mvpclmulqdq)
+    endif()
+endif()
+if(__arm64 AND NOT MSVC)
+    add_kernel_flags(source/arm/crc64_arm.c arm64 -march=armv8-a+crc+crypto)
+    # Use the same ARM instruction scheduling as the upstream AWS kernel.
+    add_kernel_flags(source/arm/crc64_arm.c arm64 -mtune=neoverse-v1)
+endif()
+
+set(__targets)
+if(AWS_CRC64_BUILD_SHARED)
+    add_library(${PROJECT_NAME}_shared SHARED)
+    add_library(${PROJECT_NAME}::${PROJECT_NAME}_shared ALIAS ${PROJECT_NAME}_shared)
+    set_target_properties(${PROJECT_NAME}_shared PROPERTIES OUTPUT_NAME ${PROJECT_NAME})
+    target_compile_definitions(${PROJECT_NAME}_shared PRIVATE AWS_CRC64_EXPORTS)
+    if(WIN32)
+        target_sources(${PROJECT_NAME}_shared PRIVATE ${PROJECT_NAME}.rc)
+    endif()
+    list(APPEND __targets ${PROJECT_NAME}_shared)
+endif()
+if(AWS_CRC64_BUILD_STATIC)
+    add_library(${PROJECT_NAME}_static STATIC)
+    add_library(${PROJECT_NAME}::${PROJECT_NAME}_static ALIAS ${PROJECT_NAME}_static)
+    target_compile_definitions(${PROJECT_NAME}_static PUBLIC AWS_CRC64_STATIC_DEFINE)
+    list(APPEND __targets ${PROJECT_NAME}_static)
+endif()
+if(AWS_CRC64_BUILD_SHARED AND NOT AWS_CRC64_BUILD_STATIC)
+    add_library(${PROJECT_NAME}::${PROJECT_NAME} ALIAS ${PROJECT_NAME}_shared)
+endif()
+if(AWS_CRC64_BUILD_STATIC AND NOT AWS_CRC64_BUILD_SHARED)
+    add_library(${PROJECT_NAME}::${PROJECT_NAME} ALIAS ${PROJECT_NAME}_static)
+endif()
+
+find_package(Threads REQUIRED)
 include(GNUInstallDirs)
-
-file(GLOB AWS_CHECKSUMS_HEADERS
-     "include/aws/checksums/*.h"
+file(GLOB_RECURSE __sources LIST_DIRECTORIES false CONFIGURE_DEPENDS
+    "./include/aws/checksums/*.h" "./source/*.h" "./source/*.c"
 )
-
-file(GLOB AWS_CHECKSUMS_PRIV_HEADERS
-     "include/aws/checksums/private/*.h"
-)
-
-file(GLOB AWS_CHECKSUMS_SRC
-    "source/*.c"
-)
-
-if(MSVC)
-     source_group("Header Files\\aws\\checksums" FILES ${AWS_CHECKSUMS_HEADERS})
-     source_group("Source Files" FILES ${AWS_CHECKSUMS_SRC})
-endif()
-
-file(GLOB CHECKSUMS_COMBINED_HEADERS
-    ${AWS_CHECKSUMS_HEADERS}
-    ${AWS_CHECKSUMS_PRIV_HEADERS}
-)
-
-file(GLOB CHECKSUMS_COMBINED_SRC
-    ${AWS_CHECKSUMS_SRC}
-    ${AWS_CHECKSUMS_PLATFORM_SOURCE}
-)
-
-add_library(${PROJECT_NAME} ${CHECKSUMS_COMBINED_HEADERS} ${CHECKSUMS_COMBINED_SRC})
-
-aws_set_common_properties(${PROJECT_NAME})
-aws_prepare_symbol_visibility_args(${PROJECT_NAME} "AWS_CHECKSUMS")
-aws_check_headers(${PROJECT_NAME} ${AWS_CHECKSUMS_HEADERS})
-
-aws_add_sanitizers(${PROJECT_NAME})
-
-set_target_properties(${PROJECT_NAME} PROPERTIES VERSION ${AWS_CHECKSUMS_VERSION})
-set_target_properties(${PROJECT_NAME} PROPERTIES SOVERSION ${AWS_CHECKSUMS_SOVERSION})
-
-if (USE_CPU_EXTENSIONS)
-    if (AWS_ARCH_INTEL)
-        file (GLOB AWS_ARCH_INTEL_SRC
-                "source/intel/*.c"
-                )
-
-        if (MSVC)
-            file(GLOB AWS_ARCH_INTRIN_SRC
-                    "source/intel/intrin/*.c"
-                )
-
-            source_group("Source Files\\intel" FILES ${AWS_ARCH_INTEL_SRC})
-            source_group("Source Files\\intel\\intrin" FILES ${AWS_ARCH_INTRIN_SRC})
+foreach(__target IN LISTS __targets)
+    target_sources(${__target} PRIVATE ${__sources})
+    target_link_libraries(${__target} PRIVATE Threads::Threads)
+    target_include_directories(${__target}
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    )
+    if(__x64)
+        target_compile_definitions(${__target} PRIVATE
+            AWS_CRC64_HAVE_CLMUL_INTRINSICS
+            AWS_CRC64_HAVE_AVX512_INTRINSICS
+        )
+    endif()
+    if(__arm64)
+        target_compile_definitions(${__target} PRIVATE AWS_CRC64_HAVE_ARM_PMULL)
+    endif()
+    if(__top_level)
+        if(WIN32)
+            target_compile_definitions(${__target} PRIVATE
+                UNICODE _UNICODE
+                NOMINMAX
+                WIN32_LEAN_AND_MEAN
+            )
+        endif()
+        if(MSVC)
+            target_compile_options(${__target} PRIVATE
+                /utf-8 /permissive-
+                $<$<NOT:$<CONFIG:Debug>>:/Gw /Gy /Zc:inline>
+            )
+            target_link_options(${__target} PRIVATE
+                $<$<NOT:$<CONFIG:Debug>>:/OPT:REF /OPT:ICF>
+            )
         else()
-            if (AWS_HAVE_GCC_INLINE_ASM)
-                simd_append_source_and_features(${PROJECT_NAME} "source/intel/asm/crc32c_sse42_asm.c" ${AWS_SSE4_2_FLAG})
+            target_compile_options(${__target} PRIVATE
+                $<$<NOT:$<CONFIG:Debug>>:-ffunction-sections -fdata-sections>
+            )
+            if(APPLE)
+                target_link_options(${__target} PRIVATE
+                    $<$<NOT:$<CONFIG:Debug>>:-Wl,-dead_strip>
+                )
+            else()
+                target_link_options(${__target} PRIVATE
+                    $<$<NOT:$<CONFIG:Debug>>:-Wl,--gc-sections>
+                )
             endif()
         endif()
-
-
-        set(UBER_FILE_FLAGS "")
-        if (AWS_HAVE_AVX512_INTRINSICS)
-            list(APPEND UBER_FILE_FLAGS ${AWS_AVX512_FLAG})
-            list(APPEND UBER_FILE_FLAGS ${AWS_AVX512vL_FLAG})
-            list(APPEND UBER_FILE_FLAGS ${AWS_AVX2_FLAG})
-            simd_append_source_and_features(${PROJECT_NAME} "source/intel/intrin/crc64nvme_avx512.c" ${AWS_AVX512_FLAG} ${AWS_AVX512vL_FLAG} ${AWS_AVX2_FLAG} ${AWS_CLMUL_FLAG} ${AWS_SSE4_2_FLAG})
-
-        endif()
-
-        if (AWS_HAVE_CLMUL)
-            list(APPEND UBER_FILE_FLAGS ${AWS_CLMUL_FLAG})
-        endif()
-
-        list(APPEND UBER_FILE_FLAGS "${AWS_SSE4_2_FLAG}")
-
-       # this file routes all of the implementations together based on available cpu features. It gets built regardless
-       # of which flags exist. The c file sorts it out.
-       simd_append_source_and_features(${PROJECT_NAME} "source/intel/intrin/crc32c_sse42_avx512.c" ${UBER_FILE_FLAGS})
-
-        if (AWS_HAVE_CLMUL)
-            simd_append_source_and_features(${PROJECT_NAME} "source/intel/intrin/crc64nvme_clmul.c" ${AWS_AVX2_FLAG} ${AWS_CLMUL_FLAG} ${AWS_SSE4_2_FLAG})
-        endif()
-
-
-    elseif(AWS_ARCH_ARM64 OR (AWS_ARCH_ARM32 AND AWS_HAVE_ARM32_CRC))
-        simd_append_source_and_features(${PROJECT_NAME} "source/arm/crc32c_arm.c" ${AWS_ARMv8_1_FLAG})
-        simd_append_source_and_features(${PROJECT_NAME} "source/arm/crc64_arm.c" ${AWS_ARMv8_1_FLAG})
-
-        if (MSVC)
-            file(GLOB AWS_ARCH_SRC
-                    "source/arm/*.c"
-                    )
-            source_group("Source Files\\arm" FILES ${AWS_ARCH_SRC})
-        endif()
     endif()
-endif()
+    set_target_properties(${__target} PROPERTIES VERSION ${PROJECT_VERSION})
+    get_target_property(__type ${__target} TYPE)
+    if(NOT "x${__type}" STREQUAL "xSTATIC_LIBRARY")
+        set_target_properties(${__target} PROPERTIES SOVERSION ${PROJECT_VERSION_MAJOR})
+    endif()
+    if(AWS_CRC64_INSTALL)
+        install(TARGETS ${__target}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        )
+    endif()
+endforeach()
 
-if (AWS_ARCH_ARM32)
-    # XXHash impl uses some unrolling pragmas that were not supported until gcc 8.0+ on arm
-    # disable warning for that. it will be slower but will continue working. 
-    if (CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION VERSION_LESS "8.0")
-        target_compile_options(${PROJECT_NAME} PRIVATE -Wno-unknown-pragmas
+if(AWS_CRC64_INSTALL)
+    install(
+        FILES include/aws/checksums/crc64.h include/aws/checksums/crc64_exports.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/aws/checksums
     )
-    endif ()
 endif()
-
-target_include_directories(${PROJECT_NAME} PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:include>)
-
-aws_use_package(aws-c-common)
-
-target_link_libraries(${PROJECT_NAME} PUBLIC ${DEP_AWS_LIBS})
-aws_prepare_shared_lib_exports(${PROJECT_NAME})
-
-install(FILES ${AWS_CHECKSUMS_HEADERS} DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/aws/checksums" COMPONENT Development)
-
-if (BUILD_SHARED_LIBS)
-    set (TARGET_DIR "shared")
-else()
-    set (TARGET_DIR "static")
-endif()
-
-install(EXPORT "${PROJECT_NAME}-targets"
-        DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}/${TARGET_DIR}"
-        NAMESPACE AWS::
-        COMPONENT Development)
-
-configure_file("cmake/${PROJECT_NAME}-config.cmake"
-        "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config.cmake"
-        @ONLY)
-
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config.cmake"
-        DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}/"
-        COMPONENT Development)
-
-include(CTest)
-if (BUILD_TESTING)
-    add_subdirectory(tests)
-    add_subdirectory(bin/benchmark)
-endif ()

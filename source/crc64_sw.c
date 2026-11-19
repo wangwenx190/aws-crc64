@@ -3,9 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0.
  */
 
-#include <aws/checksums/crc.h>
-#include <aws/checksums/private/crc64_priv.h>
-#include <aws/checksums/private/crc_util.h>
+#include "crc64_priv.h"
 
 /* CRC64NVME slice-by-8 lookup table (bit-reflected poly 0x9a6c9329ac4bc9b5) */
 /* little endian variant */
@@ -1073,7 +1071,7 @@ static uint64_t crc64nvme_table_be[8][256] = {
 
 /* Calculate a CRC-64 eight bytes at a time on a big-endian architecture. */
 static inline uint64_t s_crc64_sw_be(const uint8_t *input, int length, uint64_t prev_crc64) {
-    uint64_t crc = ~aws_bswap64_if_be(prev_crc64);
+    uint64_t crc = ~aws_crc64_bswap64_if_be(prev_crc64);
     // Read byte by byte until we reach an 8 byte aligned address
     while (length > 0 && ((intptr_t)input & 7)) {
         crc = (crc << 8) ^ crc64nvme_table_be[0][((crc >> 56) ^ *input++)];
@@ -1095,7 +1093,7 @@ static inline uint64_t s_crc64_sw_be(const uint8_t *input, int length, uint64_t 
         crc = (crc << 8) ^ crc64nvme_table_be[0][((crc >> 56) ^ input[length - remaining]) & 0xff];
         remaining--;
     }
-    return ~aws_bswap64_if_be(crc);
+    return ~aws_crc64_bswap64_if_be(crc);
 }
 
 /** Slow slice-by-8 lookup table based fallback function to compute CRC64NVME. */
@@ -1105,7 +1103,7 @@ uint64_t aws_checksums_crc64nvme_sw(const uint8_t *input, int length, uint64_t p
         return prev_crc64;
     }
 
-    if (aws_is_big_endian()) {
+    if (aws_crc64_is_big_endian()) {
         return s_crc64_sw_be(input, length, prev_crc64);
     }
 
@@ -1142,19 +1140,24 @@ uint64_t aws_checksums_crc64nvme_sw(const uint8_t *input, int length, uint64_t p
     return ~crc;
 }
 
-#if defined(__SIZEOF_INT128__)
 uint64_t aws_checksums_crc64nvme_combine_sw(uint64_t crc1, uint64_t crc2, uint64_t len2) {
 
-    if (AWS_UNLIKELY(len2 == 0)) {
+    if (AWS_CRC64_UNLIKELY(len2 == 0)) {
         return crc1;
     }
 
-    __uint128_t poly = ((__uint128_t)1 << 64) | aws_checksums_crc64nvme_constants.mu_poly[1];
+    /* Low 64 bits of the 65 bit bit-reflected polynomial - the x^64 term is implicit. */
+    const uint64_t poly = aws_checksums_crc64nvme_constants.mu_poly[1];
+
+    /*
+     * Shift crc1 by len2 zero bytes, four bits of the length at a time, using the pre-computed
+     * per-nibble shift factors. len2 is 64 bits wide, so at most 16 nibbles.
+     */
     int idx = 0;
     while (len2) {
         uint8_t nibble = len2 & 0xf;
         if (nibble) {
-            crc1 = (uint64_t)aws_checksums_multiply_mod_p_reflected(
+            crc1 = aws_checksums_multiply_mod_p_reflected(
                 poly, aws_checksums_crc64nvme_constants.shift_factors[idx][nibble][1], crc1);
         }
         idx++;
@@ -1163,27 +1166,3 @@ uint64_t aws_checksums_crc64nvme_combine_sw(uint64_t crc1, uint64_t crc2, uint64
 
     return crc1 ^ crc2;
 }
-#else
-
-static uint64_t s_crc64nvme_shift_one_zero(uint64_t poly, uint64_t crc) {
-    for (int i = 0; i < 8; i++) {
-        crc = (crc >> 1) ^ ((crc & 1) ? poly : 0);
-    }
-    return crc;
-}
-
-uint64_t aws_checksums_crc64nvme_combine_sw(uint64_t crc1, uint64_t crc2, uint64_t len2) {
-
-    static const uint64_t crc64_poly = 0x9A6C9329AC4BC9B5;
-
-    if (len2 == 0) {
-        return crc1;
-    }
-
-    for (size_t i = 0; i < len2; i++) {
-        crc1 = s_crc64nvme_shift_one_zero(crc64_poly, crc1);
-    }
-    return crc1 ^ crc2;
-}
-
-#endif
